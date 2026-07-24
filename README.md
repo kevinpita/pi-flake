@@ -55,7 +55,7 @@ Then run `pi --help` to verify.
 All three approaches (NixOS module, Home Manager module, standalone) share the same base options.
 
 | Option | Type | Default | Description |
-|--------|------|---------|-------------|
+| -------- | ------ | --------- | ------------- |
 | `enable` | `bool` | `false` | Enable the Pi Coding Agent module |
 | `package` | `package` | `pkgs.pi` | Pi package to use (useful for overriding) |
 | `mutableDir` | `bool` | `false` | When `true`, config files are copied and editable; when `false` they are read-only symlinks into the Nix store |
@@ -236,7 +236,7 @@ Override the source, version, or build inputs via `package` option or `pkgs.call
 ## Available outputs
 
 | Output | Description |
-|--------|-------------|
+| -------- | ------------- |
 | `packages.<system>.pi-coding-agent` | The compiled Pi package |
 | `packages.<system>.default` | Alias for `pi-coding-agent` |
 | `nixosModules.default` | NixOS module (`services.pi-coding-agent`) |
@@ -246,6 +246,22 @@ Override the source, version, or build inputs via `package` option or `pkgs.call
 Supported systems: `x86_64-linux`, `aarch64-linux`, `x86_64-darwin`, `aarch64-darwin`.
 
 ---
+
+## Automatic updates
+
+The update workflow checks upstream Pi releases hourly and can also be run
+manually from GitHub Actions. When a new release exists, it updates both package
+variants and their fixed-output hashes, refreshes the Bun and flake lockfiles,
+validates the packages and modules, creates a pull request, and enables squash
+auto-merge when the repository supports it.
+
+Manual local update:
+
+```bash
+bash scripts/update-prebuilt.bash v0.82.0
+bash scripts/update-node.bash v0.82.0
+nix flake update
+```
 
 ## Development
 

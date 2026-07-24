@@ -1,17 +1,17 @@
-name: update-pi
+name: Check for Updates
 
-# Keeps package.nix and package-src.nix in sync with upstream pi releases.
-# - schedule: daily check for new earendil-works/pi releases
-# - workflow_dispatch: manual trigger; pass `version` (e.g. v0.78.0) to override,
+# Keeps the Pi packages and flake inputs in sync with upstream releases.
+# - schedule: hourly check for new earendil-works/pi releases
+# - workflow_dispatch: manual trigger; pass `version` (e.g. v0.82.0) to override,
 #   leave empty to use the latest upstream release.
 
 on:
   schedule:
-    - cron: "0 6 * * *"
+    - cron: "0 * * * *"
   workflow_dispatch:
     inputs:
       version:
-        description: "Pin to a specific tag (e.g. v0.78.0). Empty = latest upstream release."
+        description: "Pin to a specific tag (e.g. v0.82.0). Empty = latest upstream release."
         required: false
         type: string
 
@@ -21,6 +21,7 @@ concurrency:
 
 permissions:
   contents: write
+  issues: write
   pull-requests: write
 
 jobs:
@@ -29,19 +30,26 @@ jobs:
     timeout-minutes: 60
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          persist-credentials: false
 
       - name: Install Nix
-        uses: cachix/install-nix-action@v27
+        uses: cachix/install-nix-action@8aa03977d8d733052d78f4e008a241fd1dbf36b3 # v31.10.6
         with:
+          nix_path: nixpkgs=channel:nixos-unstable
           extra_nix_config: |
             experimental-features = nix-command flakes
+            access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+        env:
+          NIX_FIRST_BUILD_UID: 400
 
-      # Optional: pull from a personal Cachix cache if CACHIX_AUTH_TOKEN + CACHIX_CACHE
-      # are configured as repo secrets/vars. Skip silently otherwise.
+      # Optional: pull from and push to a personal Cachix cache if
+      # CACHIX_AUTH_TOKEN + CACHIX_CACHE are configured as repo secrets/vars.
       - name: Configure Cachix (optional)
         if: vars.CACHIX_CACHE != ''
-        uses: cachix/cachix-action@v15
+        uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
         with:
           name: ${{ vars.CACHIX_CACHE }}
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
@@ -53,6 +61,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+
           if [[ -n "$INPUT_VERSION" ]]; then
             target="${INPUT_VERSION#v}"
             source="input"
@@ -60,22 +69,39 @@ jobs:
             target=$(gh api repos/earendil-works/pi/releases/latest --jq .tag_name | sed 's/^v//')
             source="upstream-latest"
           fi
-          current=$(grep -oP '^\s*version = "\K[^"]+' package-src.nix | head -1)
-          current="${current#v}"
-          echo "current=$current"
-          echo "target=$target  (source: $source)"
-          if [[ "$current" == "$target" ]]; then
+
+          current_prebuilt=$(sed -n 's/^  version = "\([^"]*\)";/\1/p' package.nix | head -1)
+          current_source=$(sed -n 's/^  version = "\([^"]*\)";/\1/p' package-src.nix | head -1)
+
+          if [[ -z "$target" || -z "$current_prebuilt" || -z "$current_source" ]]; then
+            echo "Could not resolve target or current package versions" >&2
+            exit 1
+          fi
+
+          if [[ "$current_prebuilt" == "$current_source" ]]; then
+            current="$current_source"
+          else
+            current="$current_prebuilt (prebuilt), $current_source (source)"
+          fi
+
+          echo "Current version: $current"
+          echo "Target version: $target (source: $source)"
+          echo "current=$current" >> "$GITHUB_OUTPUT"
+          echo "target=$target" >> "$GITHUB_OUTPUT"
+
+          if [[ "$current_prebuilt" == "$target" && "$current_source" == "$target" ]]; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "Already at v$current; nothing to do."
+            echo "Already at v$target; nothing to do."
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
-            echo "target=$target" >> "$GITHUB_OUTPUT"
-            echo "Will update v$current -> v$target"
+            echo "Will update $current -> v$target"
           fi
 
       - name: Update prebuilt package metadata (package.nix)
         if: steps.ver.outputs.skip != 'true'
-        run: bash scripts/update-prebuilt.bash "v${{ steps.ver.outputs.target }}"
+        env:
+          TARGET_VERSION: ${{ steps.ver.outputs.target }}
+        run: bash scripts/update-prebuilt.bash "v$TARGET_VERSION"
 
       # scripts/update-node.bash runs `nix-update` (bumps version + src hash +
       # node_modules hash via the passthru updateScript) and falls back to a
@@ -83,7 +109,24 @@ jobs:
       # disagrees.
       - name: Update source + node_modules hashes (package-src.nix)
         if: steps.ver.outputs.skip != 'true'
-        run: bash scripts/update-node.bash "v${{ steps.ver.outputs.target }}"
+        env:
+          TARGET_VERSION: ${{ steps.ver.outputs.target }}
+        run: bash scripts/update-node.bash "v$TARGET_VERSION"
+
+      - name: Update flake inputs
+        if: steps.ver.outputs.skip != 'true'
+        run: nix flake update
+
+      - name: Verify updated versions
+        if: steps.ver.outputs.skip != 'true'
+        env:
+          TARGET_VERSION: ${{ steps.ver.outputs.target }}
+        run: |
+          set -euo pipefail
+          prebuilt=$(sed -n 's/^  version = "\([^"]*\)";/\1/p' package.nix | head -1)
+          source=$(sed -n 's/^  version = "\([^"]*\)";/\1/p' package-src.nix | head -1)
+          test "$prebuilt" = "$TARGET_VERSION"
+          test "$source" = "$TARGET_VERSION"
 
       - name: Check modules
         if: steps.ver.outputs.skip != 'true'
@@ -97,25 +140,89 @@ jobs:
         if: steps.ver.outputs.skip != 'true'
         run: nix build .#pi-coding-agent-src --no-link
 
+      - name: Check Pi versions
+        if: steps.ver.outputs.skip != 'true'
+        env:
+          TARGET_VERSION: ${{ steps.ver.outputs.target }}
+        run: |
+          prebuilt_version=$(PI_PACKAGE_DIR=/nonexistent nix run .#pi-coding-agent -- --version)
+          source_version=$(PI_PACKAGE_DIR=/nonexistent nix run .#pi-coding-agent-src -- --version)
+          test "$prebuilt_version" = "$TARGET_VERSION"
+          test "$source_version" = "$TARGET_VERSION"
+
       - name: Show diff
         if: steps.ver.outputs.skip != 'true'
-        run: git --no-pager diff -- package.nix package-src.nix package-src.bun.lock
+        run: git --no-pager diff -- package.nix package-src.nix package-src.bun.lock flake.lock
 
-      - name: Open Pull Request
+      - name: Ensure automation labels
         if: steps.ver.outputs.skip != 'true'
-        uses: peter-evans/create-pull-request@v6
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh label create dependencies --color 0366d6 --description "Dependency updates" --force
+          gh label create automated --color 6f42c1 --description "Automated pull requests" --force
+
+      - name: Create Pull Request
+        if: steps.ver.outputs.skip != 'true'
+        id: create-pr
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
         with:
+          token: ${{ secrets.GITHUB_TOKEN }}
           branch: update-pi-v${{ steps.ver.outputs.target }}
           commit-message: "chore: update pi to v${{ steps.ver.outputs.target }}"
-          title: "Update pi to v${{ steps.ver.outputs.target }}"
+          title: "chore: update pi to v${{ steps.ver.outputs.target }}"
           body: |
-            Automated update for [earendil-works/pi v${{ steps.ver.outputs.target }}](https://github.com/earendil-works/pi/releases/tag/v${{ steps.ver.outputs.target }}).
+            ## Update Pi
 
-            - `package.nix`: bumped `version` and refreshed prebuilt tarball hashes via `scripts/update-prebuilt.bash`
-            - `package-src.nix`: bumped `version`, `src` hash, and `node_modules` hash via `scripts/update-node.bash`
-            - `package-src.bun.lock`: refreshed the maintained Bun lockfile used by `bun install --frozen-lockfile`
+            This PR updates Pi from ${{ steps.ver.outputs.current }} to [v${{ steps.ver.outputs.target }}](https://github.com/earendil-works/pi/releases/tag/v${{ steps.ver.outputs.target }}).
+
+            ### Changes
+            - Updated the prebuilt package version and release hashes in `package.nix`
+            - Updated the source package, npm data, and node modules hashes in `package-src.nix`
+            - Refreshed `package-src.bun.lock`
+            - Updated `flake.lock`
+
+            ---
+            This PR was automatically generated by the update workflow.
           add-paths: |
             package.nix
             package-src.nix
             package-src.bun.lock
+            flake.lock
           delete-branch: true
+          labels: |
+            dependencies
+            automated
+
+      - name: Enable Auto-Merge
+        if: steps.ver.outputs.skip != 'true' && steps.create-pr.outputs.pull-request-number
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ steps.create-pr.outputs.pull-request-number }}
+        run: gh pr merge "$PR_NUMBER" --auto --squash --delete-branch
+
+      - name: Summary
+        if: always()
+        env:
+          CURRENT_VERSION: ${{ steps.ver.outputs.current }}
+          SKIP: ${{ steps.ver.outputs.skip }}
+          TARGET_VERSION: ${{ steps.ver.outputs.target }}
+        run: |
+          {
+            echo "## Update Summary"
+            echo ""
+
+            if [[ "$SKIP" == "false" ]]; then
+              echo "- Current Version: $CURRENT_VERSION"
+              echo "- Target Version: v$TARGET_VERSION"
+              echo ""
+              echo "Pull request created. Auto-merge was attempted when supported."
+            elif [[ "$SKIP" == "true" ]]; then
+              echo "- Current Version: v$CURRENT_VERSION"
+              echo ""
+              echo "Already up to date."
+            else
+              echo "The update check did not complete successfully."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
